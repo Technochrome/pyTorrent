@@ -1,0 +1,4 @@
+http://en.wikipedia.org/wiki/Bencode
+http://en.wikipedia.org/wiki/Torrent_file
+https://wiki.theory.org/BitTorrentSpecification
+http://bittorrent.org/beps/bep_0003.html
