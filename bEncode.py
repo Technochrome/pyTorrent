@@ -21,7 +21,8 @@ def printBencode(d,tab='',listLen=10,byteLen=40):
 				print tab,key,'='
 				printBencode(d[key],tab+'\t',listLen,byteLen)
 			else:
-				printBencode(d[key],tab+key+' =',listLen,byteLen)
+				if not key.startswith('__raw_'):
+					printBencode(d[key],tab+key+' =',listLen,byteLen)
 		print tab[:-1],'}'
 	elif isinstance(d,(list,tuple)):
 		print tab,'['
@@ -56,8 +57,14 @@ def bDecodeFile(io):
 		ret = {}
 		while peek(io) != 'e':
 			key = bDecodeFile(io)
+			s = io.tell()
 			value = bDecodeFile(io)
 			ret[key] = value
+			e = io.tell()
+
+			#save raw version of entry, necessary for info_hash key
+			io.seek(s)
+			ret['__raw_'+key] = io.read(e-s)
 		io.read(1)
 		return ret
 	elif c == 'i': # int
