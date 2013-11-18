@@ -5,8 +5,29 @@ import random
 import string
 import weakref
 import hashlib
+#import bencode # python bencoder
 
 #John - multifile support, magnet links
+class peerManagement:
+	"""A class for the managing of peer connections"""
+	def __init__(self, torrenter, torrent):
+		url = torrent.torInfo['announce'] + '?' + torrent.trackerInfo(event='started')
+		response = urllib.urlopen(url)
+		self.trackerData = be.bDecode(response.read())['peers'] # using project implemented bencoder
+#		self.trackerData = bencode.bdecode(response.read())['peers'] # using python bencoder
+		for peer in self.trackerData:
+			peer['am_choking'] = 1
+			peer['am_interested'] = 0
+			peer['p_choking'] = 1
+			peer['p_interested'] = 0
+		torrent.stop()
+
+	def toString(self):
+		"""Print out the peer related data"""
+		for peer in self.trackerData:
+			for k,v in peer.iteritems():
+				print k, v
+			print "\n" 
 
 class torrenter:
 	def __init__(self):
@@ -76,4 +97,6 @@ if __name__ == "__main__":
 		tor = torrent(sys.argv[1],t)
 		be.printBencode(tor.torInfo)
 		tor.start()
+		connection = peerManagement(t, tor)
+		connection.toString()
 		tor.stop()
