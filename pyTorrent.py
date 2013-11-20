@@ -6,8 +6,29 @@ import string
 import weakref
 import hashlib
 import bisect
+#import bencode # python bencoder
 
 #John - multifile support, magnet links
+class peerManagement:
+	"""A class for the managing of peer connections"""
+	def __init__(self, torrenter, torrent):
+		url = torrent.torInfo['announce'] + '?' + torrent.trackerInfo(event='started')
+		response = urllib.urlopen(url)
+		self.trackerData = be.bDecode(response.read())['peers'] # using project implemented bencoder
+#		self.trackerData = bencode.bdecode(response.read())['peers'] # using python bencoder
+		for peer in self.trackerData:
+			peer['am_choking'] = 1
+			peer['am_interested'] = 0
+			peer['p_choking'] = 1
+			peer['p_interested'] = 0
+		torrent.stop()
+
+	def toString(self):
+		"""Print out the peer related data"""
+		for peer in self.trackerData:
+			for k,v in peer.iteritems():
+				print k, v
+			print "\n" 
 
 class torrenter:
 	def __init__(self):
@@ -22,7 +43,8 @@ class torrenter:
 
 class torrent:
 	def __init__(self,filename,torrenter):
-		self.torInfo = be.bDecodeFile(open(filename))
+		self.torInfo = be.bDecodeFile(open(filename),raw=True)
+
 		pieces = self.torInfo['info']['pieces']
 		size = 160/8
 		self.torInfo['info']['pieces'] = [bytearray(pieces[i*size:(i+1)*size]) for i in range(len(pieces)/size)]
@@ -147,7 +169,12 @@ class torrent:
 
 	@staticmethod
 	def magnetLink(url):
-		return urlparse.parse_qs(urlparse.urlparse(url)[4])
+		d = urlparse.parse_qs(urlparse.urlparse(url)[4])
+
+		xtns = 'urn:btih:'
+		if d['xt'][0].startswith(xtns):
+			return {'name':d['dn'][0], 'trackers':d['tr'], 'hash':d['xt'][0][len(xtns):].decode('hex')}
+		return None
 
 
 if __name__ == "__main__":
@@ -157,6 +184,7 @@ if __name__ == "__main__":
 	if len(sys.argv) == 2:
 		tor = torrent(sys.argv[1],t)
 		# be.printBencode(tor.torInfo)
+		print urllib.urlencode({4:hashlib.sha1(tor.torInfo['__raw_info']).digest()})
 
 		if False: #test reading and writing
 			for i in range(10):
@@ -165,9 +193,12 @@ if __name__ == "__main__":
 				arr = tor.readBlock(i)
 				print arr[:10], arr[-10:]
 		# tor.start()
+		# connection = peerManagement(t, tor)
+		# connection.toString()
 		# tor.stop()
 	elif len(sys.argv) == 3:
 		with open(sys.argv[2]) as f:
 			url = f.read()
 		print torrent.magnetLink(url)
+		print urllib.urlencode({4:torrent.magnetLink(url)['hash']})
 

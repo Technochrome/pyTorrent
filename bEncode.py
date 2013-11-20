@@ -40,12 +40,15 @@ def printBencode(d,tab='',listLen=10,byteLen=40):
 		else:
 			print tab,bytes
 	elif isinstance(d,basestring):
-		print tab,repr(d)
+		if len(d)>byteLen:
+			print tab,repr(d[0:byteLen]),'...'
+		else:
+			print tab,repr(d)
 	else:
 		print tab,d
 
 
-def bDecodeFile(io):
+def bDecodeFile(io,raw=False):
 	def _readInt(io):
 		i = 0
 		while peek(io).isdigit():
@@ -56,15 +59,16 @@ def bDecodeFile(io):
 		io.read(1)
 		ret = {}
 		while peek(io) != 'e':
-			key = bDecodeFile(io)
+			key = bDecodeFile(io,raw)
 			s = io.tell()
-			value = bDecodeFile(io)
+			value = bDecodeFile(io,raw)
 			ret[key] = value
 			e = io.tell()
 
 			#save raw version of entry, necessary for info_hash key
-			io.seek(s)
-			ret['__raw_'+key] = io.read(e-s)
+			if raw:
+				io.seek(s)
+				ret['__raw_'+key] = io.read(e-s)
 		io.read(1)
 		return ret
 	elif c == 'i': # int
@@ -76,17 +80,37 @@ def bDecodeFile(io):
 		io.read(1)
 		ret = []
 		while peek(io) != 'e':
-			ret.append(bDecodeFile(io))
+			ret.append(bDecodeFile(io,raw))
 		io.read(1) # e
 		return ret
 	else: # raw data
 		dLen = _readInt(io)
-		io.read(1) # :
+		io.read(1) # : delimiter
 		content = io.read(dLen)
 		return content
 
-def bDecode(string):
-	return bDecodeFile(StringIO.StringIO(string))
+def bEncode(obj):
+	if isinstance(obj,dict):
+		ret = 'd'
+		for key in obj:
+			ret+= bEncode(key)
+			ret+= bEncode(obj[key])
+		ret+= 'e'
+		return ret
+	elif isinstance(obj, (list, tuple)):
+		ret = 'l'
+		for el in obj:
+			ret+= bEncode(el)
+		ret+= 'e'
+		return ret
+	elif isinstance(obj, (int, long)):
+		return "i%de" % obj
+	else:
+		s = str(obj)
+		return "%d:%s" %(len(s),s)
+
+def bDecode(string,raw=False):
+	return bDecodeFile(StringIO.StringIO(string),raw)
 
 if __name__ == "__main__":
 	if len(sys.argv) == 2:
