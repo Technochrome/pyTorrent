@@ -1,16 +1,17 @@
 import bEncode as be
-import sys
-import urllib
+import sys, os
+import urllib, urlparse
 import random
 import string
 import weakref
 import hashlib
+import bisect
 
 #John - multifile support, magnet links
 
 class torrenter:
 	def __init__(self):
-		self.peer_id = '-PY0001-' + ''.join(random.choice([chr(i) for i in range(256)]) for x in range(12))
+		self.peer_id = '-PY0002-' + ''.join(random.choice([chr(i) for i in range(256)]) for x in range(12))
 		self.port = 0
 
 	def addTorrent(self,torrent):
@@ -31,7 +32,19 @@ class torrent:
 		self.trackerid = None
 		self.uploaded = 0
 		self.downloaded = 0
-		self.left = self.torInfo['info']['length']
+		self.fileStart = [0]
+		self.fileLen = []
+		self.info = self.torInfo['info']
+		if 'files' in self.info: #mutlifile mode
+			for f in self.info['files']:
+				self.fileLen.append(f['length'])
+				self.fileStart.append(self.fileStart[-1] + f['length'])
+			self.length = self.left = self.fileStart[-1]
+			self.folder = self.info['name']
+		else: #singlefile mode
+			self.length = self.left = self.info['length']
+			self.fileLen.append(self.length)
+			self.folder = None
 
 	def scrapeURL(self):
 		s = self.torInfo['announce']
@@ -64,16 +77,97 @@ class torrent:
 		response = urllib.urlopen(url)
 		be.printBencode(be.bDecode(response.read()))
 
+	
+	def file(self,idx):
+		"returns the relative path of the file number idx in the torrent"
+		path = []
+		if self.folder:
+			path.append(self.folder)
+		path.extend(self.info['files'][idx]['path'])
+		return os.path.join(*path)
+
+	def blockCallback(self,blkNum,callback,*info):
+		"""
+		A block spans multiple files, so for block: blkNum
+		Calls callback(filename, fileStart, blkStart, sectionLen, *info)
+		on each section of the block from the corresponding files
+		"""
+		#bounds check
+		if blkNum >= len(self.info['pieces']) or blkNum < 0:
+			return False
+
+		# get position
+		blkLen = self.info['piece length']
+		pieceStart = blkLen * blkNum
+		if blkNum == len(self.info['pieces']) - 1:
+			blkLen = ((self.length - 1) % blkLen) + 1
+		pieceEnd = pieceStart + blkLen
+		blkStart = 0
+
+		#find correct file
+		idx = bisect.bisect_right(self.fileStart, pieceStart) - 1
+
+		fileStart = pieceStart - self.fileStart[idx]
+		while blkStart < blkLen:
+			if self.fileLen[idx] - fileStart < blkLen - blkStart:
+				sectionLen = self.fileLen[idx] - fileStart
+			else:
+				sectionLen = blkLen - blkStart
+			callback(self.file(idx),fileStart,blkStart,sectionLen, *info)
+
+			#next file (spilled over current file)
+			blkStart += sectionLen
+			fileStart = 0
+			idx += 1
+
 	def writeBlock(self,blkNum,data):
-		pass
+		"Write data to the block number in the torrent (no error checking yet)"
+		# print 'write block',blkNum
+		def w(filename,fileStart,blkStart,sectionLen):
+			# print '  ',repr(filename), fileStart,blkStart,sectionLen
+
+			parent = os.path.dirname(filename)
+			if not os.path.exists(parent):	
+				os.makedirs(parent)
+
+			f = open(filename,'a')
+			f.seek(fileStart,0)
+			f.write(data[blkStart:blkStart+sectionLen])
+		self.blockCallback(blkNum, w)
 
 	def readBlock(self,blkNum):
-		pass
+		"Read data from the block number in the torrent (no error checking yet)"
+		data = bytearray()
+		def w(filename,fileStart,blkStart,sectionLen):
+			f = open(filename,'r')
+			f.seek(fileStart,0)
+			data.extend(f.read(sectionLen))
+		self.blockCallback(blkNum, w)
+		return data
+
+	@staticmethod
+	def magnetLink(url):
+		return urlparse.parse_qs(urlparse.urlparse(url)[4])
+
 
 if __name__ == "__main__":
+	"python __ filename.torrent"
+	"python __ -m magnetlink"
 	t = torrenter()
 	if len(sys.argv) == 2:
 		tor = torrent(sys.argv[1],t)
-		be.printBencode(tor.torInfo)
-		tor.start()
-		tor.stop()
+		# be.printBencode(tor.torInfo)
+
+		if False: #test reading and writing
+			for i in range(10):
+				tor.writeBlock(i,str(i) * tor.info['piece length'])
+			for i in range(10):	
+				arr = tor.readBlock(i)
+				print arr[:10], arr[-10:]
+		# tor.start()
+		# tor.stop()
+	elif len(sys.argv) == 3:
+		with open(sys.argv[2]) as f:
+			url = f.read()
+		print torrent.magnetLink(url)
+
