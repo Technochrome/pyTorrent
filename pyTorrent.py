@@ -6,9 +6,55 @@ import string
 import weakref
 import hashlib
 import bisect
+import struct
 #import bencode # python bencoder
 
-#John - multifile support, magnet links
+class peer:
+	pstr = "BitTorrent protocol"
+	def __init__(self, ip, port):
+		self.ip = ip
+		self.port = port
+		self.hash = torrentHash
+
+	def sendMessage(self,msg=None,payload=''):
+		def _send(data):
+			self.skt.send(struct.pack('>I',len(data)))
+			self.skt.send(data)
+		if not msg:
+			self.skt.send('')
+		else:
+			self.skt.send(chr(ord('0')+msg) + payload)
+
+	def handshake(self,info_hash,peer_id):
+		"send handshake <pstrlen><pstr><reserved><info_hash><peer_id>"
+		self.skt.send(chr(len(peer.pstr)))
+		self.skt.send(peer.pstr)
+		self.skt.send(chr(0) * 8)
+		self.skt.send(info_hash)
+		self.skt.send(peer_id)
+
+	def keepAlive(self): #every 2 minutes
+		self.sendMessage()
+	def choke(self):
+		self.sendMessage(0)
+	def unchoke(self):
+		self.sendMessage(1)
+	def interested(self):
+		self.sendMessage(2)
+	def uninterested(self):
+		self.sendMessage(3)
+	def have(self,index):
+		self.sendMessage(4, struct.pack('>I',len(index)))
+	def bitfield(self,bitfield):
+		self.sendMessage(5, bitfield)
+	def request(self,blk,offset):
+		self.sendMessage(6, struct.pack('>III',blk,offset,1<<14)) # use block size of 2^14
+	def piece(self,blk,offset,data):
+		self.sendMessage(7, struct.pack('>II',blk,offset) + data)
+	def cancel(self,blk,offset):
+		self.sendMessage(7, struct.pack('>II',blk,offset,1<<14)) # use block size of 2^14
+
+
 class peerManagement:
 	"""A class for the managing of peer connections"""
 	def __init__(self, torrenter, torrent):
