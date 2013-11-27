@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import bEncode as be
 import sys, os
 import urllib, urlparse
@@ -154,15 +156,10 @@ class torrent:
 		path.extend(self.info['files'][idx]['path'])
 		return os.path.join(*path)
 
-	def blockCallback(self,blkNum,callback,*info):
-		"""
-		A block spans multiple files, so for block: blkNum
-		Calls callback(filename, fileStart, blkStart, sectionLen, *info)
-		on each section of the block from the corresponding files
-		"""
+	def blockRange(self,blkNum):
 		#bounds check
 		if blkNum >= len(self.info['pieces']) or blkNum < 0:
-			return False
+			return (0,0)
 
 		# get position
 		blkLen = self.info['piece length']
@@ -170,7 +167,18 @@ class torrent:
 		if blkNum == len(self.info['pieces']) - 1:
 			blkLen = ((self.length - 1) % blkLen) + 1
 		pieceEnd = pieceStart + blkLen
+
+		return (pieceStart, pieceEnd)
+
+
+	def pieceCallback(self,(pieceStart,pieceEnd),callback,*info):
+		"""
+		A block spans multiple files, so for block: blkNum
+		Calls callback(filename, fileStart, blkStart, sectionLen, *info)
+		on each section of the block from the corresponding files
+		"""
 		blkStart = 0
+		blkLen = pieceEnd - pieceStart
 
 		#find correct file
 		idx = bisect.bisect_right(self.fileStart, pieceStart) - 1
@@ -188,29 +196,42 @@ class torrent:
 			fileStart = 0
 			idx += 1
 
-	def writeBlock(self,blkNum,data):
+	def writeBlock(self,blkNum,data, pieceRange=None):
 		"Write data to the block number in the torrent (no error checking yet)"
 		# print 'write block',blkNum
 		def w(filename,fileStart,blkStart,sectionLen):
-			# print '  ',repr(filename), fileStart,blkStart,sectionLen
-
 			parent = os.path.dirname(filename)
 			if not os.path.exists(parent):	
 				os.makedirs(parent)
 
-			f = open(filename,'a')
+			if not os.path.exists(filename):
+				f = open(filename,'w')
+			else:
+				f = open(filename,'r+')
 			f.seek(fileStart,0)
-			f.write(data[blkStart:blkStart+sectionLen])
-		self.blockCallback(blkNum, w)
 
-	def readBlock(self,blkNum):
+			print '  ',repr(filename), f.tell(),blkStart,sectionLen
+
+			f.write(data[blkStart:blkStart+sectionLen])
+			f.close()
+
+		if pieceRange is None:
+			pieceRange = self.blockRange(blkNum)
+
+		self.pieceCallback(pieceRange, w)
+
+	def readBlock(self,blkNum, pieceRange=None):
 		"Read data from the block number in the torrent (no error checking yet)"
 		data = bytearray()
-		def w(filename,fileStart,blkStart,sectionLen):
+		def r(filename,fileStart,blkStart,sectionLen):
 			f = open(filename,'r')
 			f.seek(fileStart,0)
 			data.extend(f.read(sectionLen))
-		self.blockCallback(blkNum, w)
+
+		if pieceRange is None:
+			pieceRange = self.blockRange(blkNum)
+
+		self.pieceCallback(pieceRange, r)
 		return data
 
 	@staticmethod
@@ -232,10 +253,10 @@ if __name__ == "__main__":
 		# be.printBencode(tor.torInfo)
 		print urllib.urlencode({4:hashlib.sha1(tor.torInfo['__raw_info']).digest()})
 
-		if False: #test reading and writing
-			for i in range(10):
+		if True: #test reading and writing
+			for i in range(9,-1,-1):
 				tor.writeBlock(i,str(i) * tor.info['piece length'])
-			for i in range(10):	
+			for i in range(0,10,1):	
 				arr = tor.readBlock(i)
 				print arr[:10], arr[-10:]
 		# tor.start()
