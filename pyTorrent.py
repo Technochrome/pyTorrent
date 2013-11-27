@@ -1,19 +1,25 @@
 #!/usr/bin/env python
 
 import bEncode as be
-import sys, os
+import sys, os, time
 import urllib, urlparse
 import random
 import string
-import weakref
+import weakref, threading
 import hashlib
 import bisect
 import struct
+from socket import *
 #import bencode # python bencoder
+
+
+#TODO
+#keep-alive message to tracker
+#connect to peers
 
 class peer:
 	pstr = "BitTorrent protocol"
-	def __init__(self, ip, port):
+	def __init__(self, ip = None, port = None, skt = None):
 		self.ip = ip
 		self.port = port
 		self.hash = torrentHash
@@ -79,15 +85,61 @@ class peerManagement:
 			print "\n" 
 
 class torrenter:
+	lastPort = 6889
+	@staticmethod
+	def listen(selfref,serverSkt):
+		serverSkt.settimeout(1.0)
+		skt = None
+		while selfref():
+			try:
+				(skt, addr) = serverSkt.accept()
+				#read handshake
+				protoLen = ord(skt.recv(1))
+				protocol = skt.recv(protoLen)
+				reserved = skt.recv(8)
+				info_hash = skt.recv(20)
+				peer_id = skt.recv(20)
+				#
+				selfref().torrents[info_hash].newconnection(skt, addr, protocol, peer_id)
+			except:
+				pass
+			finally:
+				if skt:
+					skt.close()
+				skt = None
+		serverSkt.close()
+
 	def __init__(self):
 		self.peer_id = '-PY0002-' + ''.join(random.choice([chr(i) for i in range(256)]) for x in range(12))
-		self.port = 0
+		self.shutdown = False
+		self.torrents = {}
+
+		#setup listener
+		self.serverSkt  = socket(AF_INET)
+		for port in range(6880,torrenter.lastPort+1):
+			try:
+				self.serverSkt.bind(('', port))
+				self.port = port
+				print 'started on',self.port
+				break
+			except Exception, e:
+				if port == torrenter.lastPort:
+					print e
+				pass
+
+		#listen on a socket on another thread
+		self.serverSkt.listen(5)
+		self.listener = threading.Thread(target=torrenter.listen, args=[weakref.ref(self),self.serverSkt])
+		self.listener.start()
+
+	def __del__(self):
+		self.shutdown = True
 
 	def addTorrent(self,torrent):
-		pass
+		self.torrents[torrent.info_hash] = torrent
 
 	def removeTorrent(self,torrent):
-		pass
+		self.torrents.pop(torrent.info_hash, None)
 
 class torrent:
 	def __init__(self,filename,torrenter):
@@ -98,6 +150,7 @@ class torrent:
 		self.torInfo['info']['pieces'] = [bytearray(pieces[i*size:(i+1)*size]) for i in range(len(pieces)/size)]
 
 		self.torrenter = weakref.ref(torrenter)
+		self.info_hash = hashlib.sha1(self.torInfo['__raw_info']).digest()
 
 		self.trackerid = None
 		self.uploaded = 0
@@ -124,7 +177,7 @@ class torrent:
 
 	def trackerInfo(self,event=''):
 		# need port, uploaded, downloaded, left, compact, event
-		opts = {'info_hash':hashlib.sha1(self.torInfo['__raw_info']).digest(),
+		opts = {'info_hash':self.info_hash,
 			'peer_id':self.torrenter().peer_id,
 			'port':self.torrenter().port,
 			'uploaded':self.uploaded,
@@ -136,6 +189,10 @@ class torrent:
 		if self.trackerid is not None:
 			opts['trackerid'] = self.trackerid
 		return urllib.urlencode(opts)
+
+	def newconnection(self, skt, addr, protocol, peer_id):
+		pass
+
 
 	def start(self):
 		url = self.torInfo['announce'] + '?' + self.trackerInfo(event='started')
@@ -210,7 +267,7 @@ class torrent:
 				f = open(filename,'r+')
 			f.seek(fileStart,0)
 
-			print '  ',repr(filename), f.tell(),blkStart,sectionLen
+			# print '  ',repr(filename), f.tell(),blkStart,sectionLen
 
 			f.write(data[blkStart:blkStart+sectionLen])
 			f.close()
@@ -230,6 +287,8 @@ class torrent:
 
 		if pieceRange is None:
 			pieceRange = self.blockRange(blkNum)
+		elif pieceRange[1] > self.length:
+			pieceRange[1] = self.length
 
 		self.pieceCallback(pieceRange, r)
 		return data
@@ -251,21 +310,26 @@ if __name__ == "__main__":
 	if len(sys.argv) == 2:
 		tor = torrent(sys.argv[1],t)
 		# be.printBencode(tor.torInfo)
-		print urllib.urlencode({4:hashlib.sha1(tor.torInfo['__raw_info']).digest()})
+		# print urllib.urlencode({4:hashlib.sha1(tor.torInfo['__raw_info']).digest()})
 
-		if True: #test reading and writing
+		if False: #test reading and writing
 			for i in range(9,-1,-1):
 				tor.writeBlock(i,str(i) * tor.info['piece length'])
-			for i in range(0,10,1):	
+			for i in range(0,10,2):	
 				arr = tor.readBlock(i)
 				print arr[:10], arr[-10:]
+
 		# tor.start()
 		# connection = peerManagement(t, tor)
 		# connection.toString()
+		raw_input('Press [Enter] to quit:')
+		print 'shutting down (%d)'%threading.activeCount()
+		del t
 		# tor.stop()
 	elif len(sys.argv) == 3:
 		with open(sys.argv[2]) as f:
 			url = f.read()
 		print torrent.magnetLink(url)
 		print urllib.urlencode({4:torrent.magnetLink(url)['hash']})
+	sys.exit()
 
