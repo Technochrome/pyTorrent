@@ -9,7 +9,8 @@ import weakref, threading, Queue
 import hashlib
 import bisect
 import struct
-from socket import *
+import traceback
+import socket
 #import bencode # python bencoder
 
 class obj:
@@ -62,72 +63,105 @@ class peer:
 		except: pass
 
 	@staticmethod
+	def readHandshake(skt):
+		protoLen = ord(skt.recv(1))
+		protocol = skt.recv(protoLen)
+		reserved = skt.recv(8)
+		info_hash = skt.recv(20)
+		peer_id = skt.recv(20)
+		return (protocol, info_hash, peer_id)
+
+	@staticmethod
 	def sendThread(selfref):
 		try:
-			selfref().skt = socket(AF_INET, SOCK_STREAM)
+			selfref().skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 			selfref().skt.connect((selfref().ip, selfref().port))
 			selfref().handshake()
-			print 'sent handshake'
+			# selfref().bitfield()
 
 			selfref().readThread = threading.Thread(target=peer.recvThread,args=[selfref])
 			selfref().readThread.start()
 			#tell torrent I've connected
 			while True:
 				data = selfref().writeQueue.get()
-				print hex(data)
+				print len(data),repr(data)
 				selfref().skt.send(data)
 				selfref().writeQueue.task_done()
+		except socket.error, e:
+			print 'socket error'
 		except Exception, e:
 			#tell torrent I've disconnected
-			print e
-			print 'shutting down write queue'
+			if selfref():
+				traceback.print_exc()
+				print 'shutting down write queue'
 
 	@staticmethod
 	def recvThread(selfref):
+		def get(l):
+			data = selfref().skt.recv(l,socket.MSG_WAITALL)
+			if data and len(data):
+				# print selfref().skt.getpeername(),repr(data)
+				return data
+			else:
+				return None
 		try:
+			try:
+				protocol, info_hash, selfref().peer_id = peer.readHandshake(selfref().skt)
+			except:
+				return
+
+			addr = selfref().skt.getpeername()
+			print protocol, addr
 			while True:
-				pktLen = struct.unpack('>I',selfref().skt.recv(4))[0]
+				data = get(4)
+				if not data: continue
+				pktLen = struct.unpack('>I',data)[0]
 				if pktLen == 0:
-					print 'keepAlive'
+					print addr,'keepAlive'
 					continue
-				pktType = selfref().skt.recv(1)
-				if pktType == '0':
-					print 'choke'
-				elif pktType == '1':
-					print 'unchoke'
-				elif pktType == '2':
-					print 'interested'
-				elif pktType == '3': #uninterested
-					print 'uninterested'
-				elif pktType == '4': #have
-					print 'have'
-					idx = struct.unpack('>I', selfref().skt.recv(4))[0]
-				elif pktType == '5': #bitfield
-					print 'bitfield'
-					bitfield = selfref().skt.recv(pktLen-1)
-				elif pktType == '6': #request
-					print 'request'
-					(idx, pPos, pLen) = struct.unpack('>III', selfref().skt.recv(12))
-				elif pktType == '7': #piece
-					print 'piece'
-					(idx, pPos) = struct.unpack('>II', selfref().skt.recv(8))
-					data = selfref().skt.recv(pktLen - 9)
-				elif pktType == '8': #cancel
-					print 'cancel'
-					(idx, pPos, pLen) = struct.unpack('>III', selfref().skt.recv(12))
-				elif pktType == '9': #port
-					print 'port'
-					port = struct.unpack('>H', selfref().skt.recv(2))
+				pktType = ord(get(1))
+				if pktType == 0:
+					print addr,'choke'
+				elif pktType == 1:
+					print addr,'unchoke'
+				elif pktType == 2:
+					print addr,'interested'
+				elif pktType == 3: #uninterested
+					print addr,'uninterested'
+				elif pktType == 4: #have
+					print addr,'have'
+					idx = struct.unpack('>I', get(4))[0]
+				elif pktType == 5: #bitfield
+					print addr,'bitfield'
+					bitfield = get(pktLen-1)
+				elif pktType == 6: #request
+					print addr,'request'
+					(idx, pPos, pLen) = struct.unpack('>III', get(12))
+				elif pktType == 7: #piece
+					print addr,'piece'
+					(idx, pPos) = struct.unpack('>II', get(8))
+					data = get(pktLen - 9)
+				elif pktType == 8: #cancel
+					print addr,'cancel'
+					(idx, pPos, pLen) = struct.unpack('>III', get(12))
+				elif pktType == 9: #port
+					print addr,'port'
+					port = struct.unpack('>H', get(2))
 				else:
-					selfref().skt.recv(pktLen-1)
+					# if pktLen > 0:
+						# selfref().skt.recv(pktLen-1)
+					print 'unknown packet',pktType
+		except socket.error, e:
+			print 'socket error'
 		except Exception, e:
-			print e
-			print 'shutting down read queue'
+			if selfref():
+				traceback.print_exc()
+				print 'shutting down read queue'
 
 
 	def sendMessage(self,msg=None,payload=''):
 		if not msg: data = ''
-		else:		data = chr(ord('0')+msg) + payload
+		else:		data = chr(msg) + payload
 		
 		self.writeQueue.put(struct.pack('>I',len(data)) + data)
 
@@ -151,8 +185,8 @@ class peer:
 		self.sendMessage(3)
 	def have(self,index):
 		self.sendMessage(4, struct.pack('>I',len(index)))
-	def bitfield(self,bitfield):
-		self.sendMessage(5, bitfield)
+	def bitfield(self):
+		self.sendMessage(5, self.torrent().packedAvailablePieces())
 	def request(self,blk,offset):
 		self.sendMessage(6, struct.pack('>III',blk,offset,1<<14)) # use block size of 2^14
 	def piece(self,blk,offset,data):
@@ -170,11 +204,7 @@ class torrenter:
 			try:
 				(skt, addr) = serverSkt.accept()
 				#read handshake
-				protoLen = ord(skt.recv(1))
-				protocol = skt.recv(protoLen)
-				reserved = skt.recv(8)
-				info_hash = skt.recv(20)
-				peer_id = skt.recv(20)
+				protocol, info_hash, peer_id = peer.readHandshake(skt)
 				#
 				selfref().torrents[info_hash].newconnection(skt, addr, protocol, peer_id)
 			except:
@@ -191,7 +221,7 @@ class torrenter:
 		self.torrents = {}
 
 		#setup listener
-		self.serverSkt  = socket(AF_INET)
+		self.serverSkt = socket.socket(socket.AF_INET)
 		for port in range(6880,torrenter.lastPort+1):
 			try:
 				self.serverSkt.bind(('', port))
@@ -250,11 +280,11 @@ class torrent:
 			self.folder = None
 
 	def packedAvailablePieces(self):
-		bitfield = chr(0) * int(math.ceil(self.pieceCount/8.0))
-		for idx, available in self.pieceAvailable:
+		bitfield = [0] * int(math.ceil(self.pieceCount/8.0))
+		for idx, available in enumerate(self.pieceAvailable):
 			if available:
 				bitfield[idx/8] |= 1<<(7-(idx % 8))
-		return bitfield
+		return ''.join(chr(byte) for byte in bitfield)
 
 	def scrapeURL(self):
 		s = self.torInfo['announce']
@@ -305,8 +335,12 @@ class torrent:
 		self.trackerRequest(event='started')
 
 		#connect to all peers
+		num = 0
 		for p in self.peerlist:
+			num+=1
 			self.peers[p[0]] = peer(p,self)
+			if num > 10:
+				break
 
 
 		#choose top # peers
