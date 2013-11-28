@@ -3,7 +3,7 @@
 import bEncode as be
 import sys, os, time
 import urllib, urlparse
-import random
+import random, math
 import string
 import weakref, threading
 import hashlib
@@ -12,9 +12,11 @@ import struct
 from socket import *
 #import bencode # python bencoder
 
+class obj:
+	pass
 
 #TODO
-#keep-alive message to tracker
+#reannounce to tracker
 #connect to peers
 
 class peer:
@@ -23,6 +25,8 @@ class peer:
 		self.ip = ip
 		self.port = port
 		self.hash = torrentHash
+
+		self.unchoked = self.interested = False
 
 	def sendMessage(self,msg=None,payload=''):
 		def _send(data):
@@ -61,28 +65,6 @@ class peer:
 		self.sendMessage(7, struct.pack('>II',blk,offset) + data)
 	def cancel(self,blk,offset):
 		self.sendMessage(7, struct.pack('>II',blk,offset,1<<14)) # use block size of 2^14
-
-
-class peerManagement:
-	"""A class for the managing of peer connections"""
-	def __init__(self, torrenter, torrent):
-		url = torrent.torInfo['announce'] + '?' + torrent.trackerInfo(event='started')
-		response = urllib.urlopen(url)
-		self.trackerData = be.bDecode(response.read())['peers'] # using project implemented bencoder
-#		self.trackerData = bencode.bdecode(response.read())['peers'] # using python bencoder
-		for peer in self.trackerData:
-			peer['am_choking'] = 1
-			peer['am_interested'] = 0
-			peer['p_choking'] = 1
-			peer['p_interested'] = 0
-		torrent.stop()
-
-	def toString(self):
-		"""Print out the peer related data"""
-		for peer in self.trackerData:
-			for k,v in peer.iteritems():
-				print k, v
-			print "\n" 
 
 class torrenter:
 	lastPort = 6889
@@ -147,14 +129,16 @@ class torrent:
 
 		pieces = self.torInfo['info']['pieces']
 		size = 160/8
-		self.torInfo['info']['pieces'] = [bytearray(pieces[i*size:(i+1)*size]) for i in range(len(pieces)/size)]
+		self.pieceHash = [bytearray(pieces[i*size:(i+1)*size]) for i in range(len(pieces)/size)]
+		self.pieceCount = len(self.pieceHash)
+		self.pieceAvailable = chr(0)*self.pieceCount #RELOAD
 
 		self.torrenter = weakref.ref(torrenter)
 		self.info_hash = hashlib.sha1(self.torInfo['__raw_info']).digest()
 
 		self.trackerid = None
-		self.uploaded = 0
-		self.downloaded = 0
+		self.uploaded = 0	#RELOAD
+		self.downloaded = 0	#RELOAD
 		self.fileStart = [0]
 		self.fileLen = []
 		self.info = self.torInfo['info']
@@ -169,6 +153,13 @@ class torrent:
 			self.fileLen.append(self.length)
 			self.folder = None
 
+	def packedAvailablePieces(self):
+		bitfield = chr(0) * int(math.ceil(self.pieceCount/8.0))
+		for idx, available in self.pieceAvailable:
+			if available:
+				bitfield[idx/8] |= 1<<(7-(idx % 8))
+		return bitfield
+
 	def scrapeURL(self):
 		s = self.torInfo['announce']
 		if re.match(r'.*/(announce)[^/]*',s).end == len(s):
@@ -176,34 +167,51 @@ class torrent:
 		return None
 
 	def trackerInfo(self,event=''):
-		# need port, uploaded, downloaded, left, compact, event
 		opts = {'info_hash':self.info_hash,
 			'peer_id':self.torrenter().peer_id,
 			'port':self.torrenter().port,
 			'uploaded':self.uploaded,
 			'downloaded':self.downloaded,
 			'left':self.left,
-			'event':event
-			#,'compact':'1'
+			'event':event,
+			'compact':'1'
 			}
 		if self.trackerid is not None:
 			opts['trackerid'] = self.trackerid
 		return urllib.urlencode(opts)
 
 	def newconnection(self, skt, addr, protocol, peer_id):
-		pass
+		print 'peer trying to connect:',addr,protocol,peer_id
+
+
+	def trackerRequest(event='',setpeerlist=True):
+		url = self.torInfo['announce'] + '?' + self.trackerInfo(event=event)
+		response = be.bDecode(urllib.urlopen(url).read())
+		if 'failure reason' in response:
+			print 'Tracker returned error',repr(response['failure reason'])
+			return
+
+		self.interval = int(response['interval'])
+		if 'tracker id' in response:
+			self.trackerid = response['tracker id']
+		if setpeerlist:
+			self.peerlist = response['peers']
+			if isinstance(self.peerlist,list):
+				self.peerlist = [(peer['ip'], peer['port']) for peer in self.peerlist]
+			else: #short format
+				self.peerlist = [(
+					'.'.join([str(ord(c)) for c in self.peerlist[s:s+4]]),
+					ord(self.peerlist[s+4])*256 + ord(self.peerlist[s+5]))
+				for s in range(0,len(self.peerlist),6)]
+			print self.peerlist
 
 
 	def start(self):
-		url = self.torInfo['announce'] + '?' + self.trackerInfo(event='started')
-		response = urllib.urlopen(url)
-		be.printBencode(be.bDecode(response.read()))
-
+		trackerRequest(event='started')
+	def announce(self):
+		trackerRequest()
 	def stop(self):
-		url = self.torInfo['announce'] + '?' + self.trackerInfo(event='stopped')
-		response = urllib.urlopen(url)
-		be.printBencode(be.bDecode(response.read()))
-
+		trackerRequest(event='stopped',setpeerlist=False)
 	
 	def file(self,idx):
 		"returns the relative path of the file number idx in the torrent"
@@ -319,13 +327,13 @@ if __name__ == "__main__":
 				arr = tor.readBlock(i)
 				print arr[:10], arr[-10:]
 
-		# tor.start()
+		tor.start()
 		# connection = peerManagement(t, tor)
 		# connection.toString()
-		raw_input('Press [Enter] to quit:')
+		raw_input('Press [Enter] to quit\n')
 		print 'shutting down (%d)'%threading.activeCount()
+		tor.stop()
 		del t
-		# tor.stop()
 	elif len(sys.argv) == 3:
 		with open(sys.argv[2]) as f:
 			url = f.read()
