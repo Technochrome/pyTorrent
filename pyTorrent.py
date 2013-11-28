@@ -5,7 +5,7 @@ import sys, os, time
 import urllib, urlparse
 import random, math
 import string
-import weakref, threading
+import weakref, threading, Queue
 import hashlib
 import bisect
 import struct
@@ -15,35 +15,129 @@ from socket import *
 class obj:
 	pass
 
+class queueThread:
+	def runloop(self):
+		while True:
+			try:
+				(target, args, kwargs) = self._queue.get()
+				if not target:
+					return
+				target(*args,**kwargs)
+			except:
+				return
+
+	def __init__(self):
+		self.thread = threading.Thread(target=self.runloop)
+		self._queue = Queue.Queue()
+		self.thread.run()
+
+	def do(target, args = [], kwargs={}):
+		self._queue.put((target,args,kwargs))
+
+	def shutdown(self):
+		self._queue.put((None,None,None))
+
+
 #TODO
 #reannounce to tracker
 #connect to peers
 
 class peer:
 	pstr = "BitTorrent protocol"
-	def __init__(self, ip = None, port = None, skt = None):
+	# interestingBlocks
+	def __init__(self, (ip, port), torrent):
 		self.ip = ip
 		self.port = port
-		self.hash = torrentHash
+		self.torrent = weakref.ref(torrent)
 
 		self.unchoked = self.interested = False
 
-	def sendMessage(self,msg=None,payload=''):
-		def _send(data):
-			self.skt.send(struct.pack('>I',len(data)))
-			self.skt.send(data)
-		if not msg:
-			self.skt.send('')
-		else:
-			self.skt.send(chr(ord('0')+msg) + payload)
+		self.readQueue = Queue.Queue()
+		self.writeQueue = Queue.Queue()
 
-	def handshake(self,info_hash,peer_id):
-		"send handshake <pstrlen><pstr><reserved><info_hash><peer_id>"
+		self.writeThread = threading.Thread(target=peer.sendThread,args=[weakref.ref(self)])
+		self.writeThread.start()
+	def __del__(self):
+		try: self.skt.close()
+		except: pass
+
+	@staticmethod
+	def sendThread(selfref):
+		try:
+			selfref().skt = socket(AF_INET, SOCK_STREAM)
+			selfref().skt.connect((selfref().ip, selfref().port))
+			selfref().handshake()
+			print 'sent handshake'
+
+			selfref().readThread = threading.Thread(target=peer.recvThread,args=[selfref])
+			selfref().readThread.start()
+			#tell torrent I've connected
+			while True:
+				data = selfref().writeQueue.get()
+				print hex(data)
+				selfref().skt.send(data)
+				selfref().writeQueue.task_done()
+		except Exception, e:
+			#tell torrent I've disconnected
+			print e
+			print 'shutting down write queue'
+
+	@staticmethod
+	def recvThread(selfref):
+		try:
+			while True:
+				pktLen = struct.unpack('>I',selfref().skt.recv(4))[0]
+				if pktLen == 0:
+					print 'keepAlive'
+					continue
+				pktType = selfref().skt.recv(1)
+				if pktType == '0':
+					print 'choke'
+				elif pktType == '1':
+					print 'unchoke'
+				elif pktType == '2':
+					print 'interested'
+				elif pktType == '3': #uninterested
+					print 'uninterested'
+				elif pktType == '4': #have
+					print 'have'
+					idx = struct.unpack('>I', selfref().skt.recv(4))[0]
+				elif pktType == '5': #bitfield
+					print 'bitfield'
+					bitfield = selfref().skt.recv(pktLen-1)
+				elif pktType == '6': #request
+					print 'request'
+					(idx, pPos, pLen) = struct.unpack('>III', selfref().skt.recv(12))
+				elif pktType == '7': #piece
+					print 'piece'
+					(idx, pPos) = struct.unpack('>II', selfref().skt.recv(8))
+					data = selfref().skt.recv(pktLen - 9)
+				elif pktType == '8': #cancel
+					print 'cancel'
+					(idx, pPos, pLen) = struct.unpack('>III', selfref().skt.recv(12))
+				elif pktType == '9': #port
+					print 'port'
+					port = struct.unpack('>H', selfref().skt.recv(2))
+				else:
+					selfref().skt.recv(pktLen-1)
+		except Exception, e:
+			print e
+			print 'shutting down read queue'
+
+
+	def sendMessage(self,msg=None,payload=''):
+		if not msg: data = ''
+		else:		data = chr(ord('0')+msg) + payload
+		
+		self.writeQueue.put(struct.pack('>I',len(data)) + data)
+
+	def handshake(self):
+		"send handshake: <pstrlen><pstr><reserved><info_hash><peer_id>"
 		self.skt.send(chr(len(peer.pstr)))
 		self.skt.send(peer.pstr)
 		self.skt.send(chr(0) * 8)
-		self.skt.send(info_hash)
-		self.skt.send(peer_id)
+		self.skt.send(self.torrent().info_hash)
+		self.skt.send(self.torrent().torrenter().peer_id)
 
 	def keepAlive(self): #every 2 minutes
 		self.sendMessage()
@@ -64,7 +158,7 @@ class peer:
 	def piece(self,blk,offset,data):
 		self.sendMessage(7, struct.pack('>II',blk,offset) + data)
 	def cancel(self,blk,offset):
-		self.sendMessage(7, struct.pack('>II',blk,offset,1<<14)) # use block size of 2^14
+		self.sendMessage(8, struct.pack('>III',blk,offset,1<<14)) # use block size of 2^14
 
 class torrenter:
 	lastPort = 6889
@@ -135,6 +229,8 @@ class torrent:
 
 		self.torrenter = weakref.ref(torrenter)
 		self.info_hash = hashlib.sha1(self.torInfo['__raw_info']).digest()
+		self.peerlist = []
+		self.peers = {}
 
 		self.trackerid = None
 		self.uploaded = 0	#RELOAD
@@ -184,7 +280,7 @@ class torrent:
 		print 'peer trying to connect:',addr,protocol,peer_id
 
 
-	def trackerRequest(event='',setpeerlist=True):
+	def trackerRequest(self,event='',setpeerlist=True):
 		url = self.torInfo['announce'] + '?' + self.trackerInfo(event=event)
 		response = be.bDecode(urllib.urlopen(url).read())
 		if 'failure reason' in response:
@@ -203,15 +299,31 @@ class torrent:
 					'.'.join([str(ord(c)) for c in self.peerlist[s:s+4]]),
 					ord(self.peerlist[s+4])*256 + ord(self.peerlist[s+5]))
 				for s in range(0,len(self.peerlist),6)]
-			print self.peerlist
 
 
 	def start(self):
-		trackerRequest(event='started')
+		self.trackerRequest(event='started')
+
+		#connect to all peers
+		for p in self.peerlist:
+			self.peers[p[0]] = peer(p,self)
+
+
+		#choose top # peers
+		#find lowest block they have which I want
+		# start downloading from top list of peers
+		#
+		#Choking algorithm
+		# top 4/5 downloaders who are interested
+		#
+		#Interested algorithm
+		# find everywhere I'm not choked
+		# request slice
+
 	def announce(self):
-		trackerRequest()
+		self.trackerRequest()
 	def stop(self):
-		trackerRequest(event='stopped',setpeerlist=False)
+		self.trackerRequest(event='stopped',setpeerlist=False)
 	
 	def file(self,idx):
 		"returns the relative path of the file number idx in the torrent"
@@ -318,7 +430,6 @@ if __name__ == "__main__":
 	if len(sys.argv) == 2:
 		tor = torrent(sys.argv[1],t)
 		# be.printBencode(tor.torInfo)
-		# print urllib.urlencode({4:hashlib.sha1(tor.torInfo['__raw_info']).digest()})
 
 		if False: #test reading and writing
 			for i in range(9,-1,-1):
