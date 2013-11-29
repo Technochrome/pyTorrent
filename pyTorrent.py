@@ -16,32 +16,59 @@ import socket
 class obj:
 	pass
 
-class queueThread:
+class runloop:
 	def runloop(self):
 		while True:
 			try:
-				(target, args, kwargs) = self._queue.get()
+				(target, args, kwargs) = self()._queue.get()
 				if not target:
 					return
-				target(*args,**kwargs)
+				try:
+					target(*args,**kwargs)
+				except:
+					traceback.print_exc()
 			except:
 				return
 
 	def __init__(self):
-		self.thread = threading.Thread(target=self.runloop)
+		self.thread = threading.Thread(target=runloop.runloop, args=weakref.ref(self))
 		self._queue = Queue.Queue()
-		self.thread.run()
+		self.thread.start()
 
-	def do(target, args = [], kwargs={}):
+	def do(self, target, args = [], kwargs={}):
 		self._queue.put((target,args,kwargs))
 
 	def shutdown(self):
 		self._queue.put((None,None,None))
 
+	def __del__(self):
+		self.shutdown()
+
+class pieceBitfield:
+	def __init__(self, pieces=0, bitfield=None):
+		if bitfield:
+			self.bytes = bytearray(bitfield)
+		else:
+			self.bytes = bytearray([0])*int(math.ceil(pieces/8.0))
+
+	def set(self, bytes):
+		if len(self.bytes) == len(bytes):
+			self.bytes = bytearray(bytes)
+
+	def __getitem__(self,key):
+		return (self.bytes[key/8] << (key % 8)) & 0x80
+
+	def __setitem__(self,key,value):
+		if value:
+			self.bytes[key/8] |= (0x80 >> (key % 8))
+		else:
+			self.bytes[key/8] &= (0xff7f >> (key % 8))
+
+	def __str__(self):
+		return "".join("%02x" % b for b in self.bytes)
 
 #TODO
 #reannounce to tracker
-#connect to peers
 
 class peer:
 	pstr = "BitTorrent protocol"
@@ -51,12 +78,16 @@ class peer:
 		self.port = port
 		self.torrent = weakref.ref(torrent)
 
-		self.unchoked = self.interested = False
+		self.choked = self.choking = True
+		self.interested = self.interesting = False
+
+		self.pieceAvailable = pieceBitfield(torrent.pieceCount)
+		self.interestingPieces = 0
 
 		self.readQueue = Queue.Queue()
 		self.writeQueue = Queue.Queue()
 
-		self.writeThread = threading.Thread(target=peer.sendThread,args=[weakref.ref(self)])
+		self.writeThread = threading.Thread(target=peer.readWriteThread,args=[weakref.ref(self)])
 		self.writeThread.start()
 	def __del__(self):
 		try: self.skt.close()
@@ -72,16 +103,92 @@ class peer:
 		return (protocol, info_hash, peer_id)
 
 	@staticmethod
-	def sendThread(selfref):
-		try:
-			selfref().skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-			selfref().skt.connect((selfref().ip, selfref().port))
-			selfref().handshake()
-			# selfref().bitfield()
+	def readWriteThread(selfref):
+		established = hasattr(selfref(),'skt')
+		if not established:
+			try:
+				selfref().skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+				selfref().skt.connect((selfref().ip, selfref().port))
+			except:
+				print 'connection failed', selfref().ip, selfref().port
+				return
 
-			selfref().readThread = threading.Thread(target=peer.recvThread,args=[selfref])
-			selfref().readThread.start()
-			#tell torrent I've connected
+		selfref().handshake()
+		addr = selfref().skt.getpeername()
+
+		def recv():
+			def get(l):
+				if l <= 0: return None
+				return selfref().skt.recv(l,socket.MSG_WAITALL)
+			try:
+				if not established:
+					try: protocol, info_hash, selfref().peer_id = peer.readHandshake(selfref().skt)
+					except: 
+						print 'no handshake from',addr
+						selfref().skt.close()
+						return
+
+					print protocol, addr
+				print 'connected to',addr
+				#tell torrent I've connected
+				while True:
+					data = get(4)
+					pktLen = struct.unpack('>I',data)[0]
+					if pktLen == 0:
+						print addr,'keepAlive'
+						continue
+					pktType = ord(get(1))
+					if pktType == 0:
+						selfref().choking = True
+						print addr,'choke'
+					elif pktType == 1:
+						selfref().choking = False
+						print addr,'unchoke'
+					elif pktType == 2:
+						selfref().interested = True
+						print addr,'interested'
+					elif pktType == 3:
+						selfref().interested = False
+						print addr,'uninterested'
+					elif pktType == 4:
+						print addr,'have'
+						idx = struct.unpack('>I', get(4))[0]
+						selfref().pieceAvailable[idx] = True
+						if not selfref().torrent().pieceAvailable[idx]:
+							selfref().interestingPieces += 1
+					elif pktType == 5:
+						print addr,'bitfield'
+						selfref().pieceAvailable.set(get(pktLen-1))
+						print selfref().pieceAvailable
+					elif pktType == 6:
+						print addr,'request'
+						(idx, pPos, pLen) = struct.unpack('>III', get(12))
+						# if not self.choked and selfref().torrent().pieceAvailable[idx]:
+							# self.piece()
+					elif pktType == 7:
+						print addr,'piece'
+						(idx, pPos) = struct.unpack('>II', get(8))
+						data = get(pktLen - 9)
+					elif pktType == 8:
+						print addr,'cancel, ignoring'
+						(idx, pPos, pLen) = struct.unpack('>III', get(12))
+					elif pktType == 9:
+						print addr,'port, ignoring'
+						port = struct.unpack('>H', get(2))
+					else:
+						get(pktLen-1)
+						print 'unknown packet',pktType
+			except socket.error, e:
+				print 'socket error'
+			except Exception, e:
+				if selfref():
+					traceback.print_exc()
+					print 'shutting down read queue',addr
+
+		selfref().readThread = threading.Thread(target=recv)
+		selfref().readThread.start()
+
+		try:
 			while True:
 				data = selfref().writeQueue.get()
 				print len(data),repr(data)
@@ -90,73 +197,11 @@ class peer:
 		except socket.error, e:
 			print 'socket error'
 		except Exception, e:
-			#tell torrent I've disconnected
 			if selfref():
 				traceback.print_exc()
-				print 'shutting down write queue'
+				print 'shutting down write queue',addr
 
-	@staticmethod
-	def recvThread(selfref):
-		def get(l):
-			data = selfref().skt.recv(l,socket.MSG_WAITALL)
-			if data and len(data):
-				# print selfref().skt.getpeername(),repr(data)
-				return data
-			else:
-				return None
-		try:
-			try:
-				protocol, info_hash, selfref().peer_id = peer.readHandshake(selfref().skt)
-			except:
-				return
-
-			addr = selfref().skt.getpeername()
-			print protocol, addr
-			while True:
-				data = get(4)
-				if not data: continue
-				pktLen = struct.unpack('>I',data)[0]
-				if pktLen == 0:
-					print addr,'keepAlive'
-					continue
-				pktType = ord(get(1))
-				if pktType == 0:
-					print addr,'choke'
-				elif pktType == 1:
-					print addr,'unchoke'
-				elif pktType == 2:
-					print addr,'interested'
-				elif pktType == 3: #uninterested
-					print addr,'uninterested'
-				elif pktType == 4: #have
-					print addr,'have'
-					idx = struct.unpack('>I', get(4))[0]
-				elif pktType == 5: #bitfield
-					print addr,'bitfield'
-					bitfield = get(pktLen-1)
-				elif pktType == 6: #request
-					print addr,'request'
-					(idx, pPos, pLen) = struct.unpack('>III', get(12))
-				elif pktType == 7: #piece
-					print addr,'piece'
-					(idx, pPos) = struct.unpack('>II', get(8))
-					data = get(pktLen - 9)
-				elif pktType == 8: #cancel
-					print addr,'cancel'
-					(idx, pPos, pLen) = struct.unpack('>III', get(12))
-				elif pktType == 9: #port
-					print addr,'port'
-					port = struct.unpack('>H', get(2))
-				else:
-					# if pktLen > 0:
-						# selfref().skt.recv(pktLen-1)
-					print 'unknown packet',pktType
-		except socket.error, e:
-			print 'socket error'
-		except Exception, e:
-			if selfref():
-				traceback.print_exc()
-				print 'shutting down read queue'
+		#tell torrent I've disconnected
 
 
 	def sendMessage(self,msg=None,payload=''):
@@ -176,25 +221,30 @@ class peer:
 	def keepAlive(self): #every 2 minutes
 		self.sendMessage()
 	def choke(self):
+		self.choked = True
 		self.sendMessage(0)
 	def unchoke(self):
+		self.choked = False
 		self.sendMessage(1)
 	def interested(self):
+		self.interesting = True
 		self.sendMessage(2)
 	def uninterested(self):
+		self.interesting = False
 		self.sendMessage(3)
 	def have(self,index):
 		self.sendMessage(4, struct.pack('>I',len(index)))
 	def bitfield(self):
-		self.sendMessage(5, self.torrent().packedAvailablePieces())
+		self.sendMessage(5, self.torrent().pieceAvailable.bytes)
 	def request(self,blk,offset):
-		self.sendMessage(6, struct.pack('>III',blk,offset,1<<14)) # use block size of 2^14
+		self.sendMessage(6, struct.pack('>III',blk,offset,math.min(1<<14, self.torrent().blockRange(blk)[1] - offset))) # use block size of 2^14
 	def piece(self,blk,offset,data):
 		self.sendMessage(7, struct.pack('>II',blk,offset) + data)
 	def cancel(self,blk,offset):
-		self.sendMessage(8, struct.pack('>III',blk,offset,1<<14)) # use block size of 2^14
+		self.sendMessage(8, struct.pack('>III',blk,offset,math.min(1<<14, self.torrent().blockRange(blk)[1] - offset))) # use block size of 2^14
 
 class torrenter:
+	firstPort = 6880
 	lastPort = 6889
 	@staticmethod
 	def listen(selfref,serverSkt):
@@ -222,7 +272,7 @@ class torrenter:
 
 		#setup listener
 		self.serverSkt = socket.socket(socket.AF_INET)
-		for port in range(6880,torrenter.lastPort+1):
+		for port in range(torrenter.firstPort, torrenter.lastPort+1):
 			try:
 				self.serverSkt.bind(('', port))
 				self.port = port
@@ -255,7 +305,7 @@ class torrent:
 		size = 160/8
 		self.pieceHash = [bytearray(pieces[i*size:(i+1)*size]) for i in range(len(pieces)/size)]
 		self.pieceCount = len(self.pieceHash)
-		self.pieceAvailable = chr(0)*self.pieceCount #RELOAD
+		self.pieceAvailable = pieceBitfield(self.pieceCount) #RELOAD
 
 		self.torrenter = weakref.ref(torrenter)
 		self.info_hash = hashlib.sha1(self.torInfo['__raw_info']).digest()
@@ -278,13 +328,6 @@ class torrent:
 			self.length = self.left = self.info['length']
 			self.fileLen.append(self.length)
 			self.folder = None
-
-	def packedAvailablePieces(self):
-		bitfield = [0] * int(math.ceil(self.pieceCount/8.0))
-		for idx, available in enumerate(self.pieceAvailable):
-			if available:
-				bitfield[idx/8] |= 1<<(7-(idx % 8))
-		return ''.join(chr(byte) for byte in bitfield)
 
 	def scrapeURL(self):
 		s = self.torInfo['announce']
@@ -377,19 +420,19 @@ class torrent:
 		pieceStart = blkLen * blkNum
 		if blkNum == len(self.info['pieces']) - 1:
 			blkLen = ((self.length - 1) % blkLen) + 1
-		pieceEnd = pieceStart + blkLen
 
-		return (pieceStart, pieceEnd)
+		return (pieceStart, blkLen)
 
 
-	def pieceCallback(self,(pieceStart,pieceEnd),callback,*info):
+	def pieceCallback(self,(pieceStart,pieceLen),callback,*info):
 		"""
 		A block spans multiple files, so for block: blkNum
 		Calls callback(filename, fileStart, blkStart, sectionLen, *info)
 		on each section of the block from the corresponding files
 		"""
 		blkStart = 0
-		blkLen = pieceEnd - pieceStart
+		blkLen = pieceLen
+		pieceEnd = pieceStart + pieceLen
 
 		#find correct file
 		idx = bisect.bisect_right(self.fileStart, pieceStart) - 1
