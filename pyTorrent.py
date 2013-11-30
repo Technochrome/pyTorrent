@@ -11,16 +11,16 @@ import bisect
 import struct
 import traceback
 import socket
-#import bencode # python bencoder
 
 class obj:
 	pass
 
 class runloop:
-	def runloop(self):
+	@staticmethod
+	def runloop(selfref):
 		while True:
 			try:
-				(target, args, kwargs) = self()._queue.get()
+				(target, args, kwargs) = selfref()._queue.get()
 				if not target:
 					return
 				try:
@@ -31,7 +31,7 @@ class runloop:
 				return
 
 	def __init__(self):
-		self.thread = threading.Thread(target=runloop.runloop, args=weakref.ref(self))
+		self.thread = threading.Thread(target=runloop.runloop, args=[weakref.ref(self)])
 		self._queue = Queue.Queue()
 		self.thread.start()
 
@@ -44,6 +44,23 @@ class runloop:
 	def __del__(self):
 		self.shutdown()
 
+class repeatTimer:
+	def __init__(self, interval, action, args=[], kwargs={}):
+		self.stop = False
+		self.timer = threading.Timer(interval, self.execute, [interval, action, args, kwargs])
+		self.timer.start()
+	def execute(self,interval,action,args,kwargs):
+		action(*args,**kwargs)
+		if not self.stop:
+			self.timer = threading.Timer(interval, self.execute, [interval, action, args, kwargs])
+			self.timer.start()
+	def cancel(self):
+		self.stop = True
+		self.timer.cancel()
+	def __del__(self):
+		self.cancel()
+
+
 class pieceBitfield:
 	def __init__(self, pieces=0, bitfield=None):
 		if bitfield:
@@ -54,6 +71,9 @@ class pieceBitfield:
 	def set(self, bytes):
 		if len(self.bytes) == len(bytes):
 			self.bytes = bytearray(bytes)
+
+	def __len__(self):
+		return len(self.bytes)*8
 
 	def __getitem__(self,key):
 		return (self.bytes[key/8] << (key % 8)) & 0x80
@@ -66,6 +86,9 @@ class pieceBitfield:
 
 	def __str__(self):
 		return "".join("%02x" % b for b in self.bytes)
+
+
+mainLoop = runloop()
 
 #TODO
 #reannounce to tracker
@@ -131,6 +154,7 @@ class peer:
 					print protocol, addr
 				print 'connected to',addr
 				#tell torrent I've connected
+				mainLoop.do(selfref().torrent().connection, [selfref()])
 				while True:
 					data = get(4)
 					pktLen = struct.unpack('>I',data)[0]
