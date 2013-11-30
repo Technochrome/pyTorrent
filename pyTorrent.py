@@ -95,17 +95,16 @@ mainLoop = runloop()
 
 class peer:
 	pstr = "BitTorrent protocol"
-	# interestingBlocks
 	def __init__(self, (ip, port), torrent):
 		self.ip = ip
 		self.port = port
 		self.torrent = weakref.ref(torrent)
 
-		self.choked = self.choking = True
-		self.interested = self.interesting = False
+		self._choked = self.choking = True
+		self.interested = self._interesting = False
 
 		self.pieceAvailable = pieceBitfield(torrent.pieceCount)
-		self.interestingPieces = 0
+		self.interestingBlocks = set()
 
 		self.readQueue = Queue.Queue()
 		self.writeQueue = Queue.Queue()
@@ -133,7 +132,9 @@ class peer:
 				selfref().skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 				selfref().skt.connect((selfref().ip, selfref().port))
 			except:
-				print 'connection failed', selfref().ip, selfref().port
+				# print 'connection failed', selfref().ip, selfref().port
+				#tell torrent I've disconnected
+				mainLoop.do(selfref().torrent().disconnection, [(selfref().ip, selfref().port)])
 				return
 
 		selfref().handshake()
@@ -154,51 +155,69 @@ class peer:
 					print protocol, addr
 				print 'connected to',addr
 				#tell torrent I've connected
-				mainLoop.do(selfref().torrent().connection, [selfref()])
+				keepAliveTimer = repeatTimer(120,selfref().keepAlive)
 				while True:
 					data = get(4)
+					if len(data) < 4:
+						raise socket.error() 
 					pktLen = struct.unpack('>I',data)[0]
-					if pktLen == 0:
-						print addr,'keepAlive'
+
+					if pktLen == 0: #keepAlive
 						continue
+
 					pktType = ord(get(1))
-					if pktType == 0:
+					if pktType == 0: #choke
 						selfref().choking = True
 						print addr,'choke'
-					elif pktType == 1:
+
+					elif pktType == 1: #unchoke
 						selfref().choking = False
 						print addr,'unchoke'
-					elif pktType == 2:
+
+					elif pktType == 2: #interested
 						selfref().interested = True
 						print addr,'interested'
-					elif pktType == 3:
+
+					elif pktType == 3: #uninterested
 						selfref().interested = False
 						print addr,'uninterested'
-					elif pktType == 4:
-						print addr,'have'
+
+					elif pktType == 4: #have
 						idx = struct.unpack('>I', get(4))[0]
+						# print addr,'have',idx
 						selfref().pieceAvailable[idx] = True
 						if not selfref().torrent().pieceAvailable[idx]:
-							selfref().interestingPieces += 1
-					elif pktType == 5:
-						print addr,'bitfield'
+							selfref().interesting = True
+							selfref().interestingBlocks.add(idx)
+
+					elif pktType == 5: #bitfield
+						# print addr,'bitfield'
 						selfref().pieceAvailable.set(get(pktLen-1))
-						print selfref().pieceAvailable
-					elif pktType == 6:
+						# print selfref().pieceAvailable
+						for idx in range(len(selfref().pieceAvailable)):
+							if not selfref().torrent().pieceAvailable[idx]:
+								selfref().interesting = True
+								selfref().interestingBlocks.add(idx)
+
+					elif pktType == 6: #request
 						print addr,'request'
 						(idx, pPos, pLen) = struct.unpack('>III', get(12))
 						# if not self.choked and selfref().torrent().pieceAvailable[idx]:
 							# self.piece()
-					elif pktType == 7:
+
+					elif pktType == 7: #piece
 						print addr,'piece'
 						(idx, pPos) = struct.unpack('>II', get(8))
 						data = get(pktLen - 9)
-					elif pktType == 8:
+
+					elif pktType == 8: #cancel
 						print addr,'cancel, ignoring'
 						(idx, pPos, pLen) = struct.unpack('>III', get(12))
-					elif pktType == 9:
+
+					elif pktType == 9: #port
 						print addr,'port, ignoring'
 						port = struct.unpack('>H', get(2))
+
 					else:
 						get(pktLen-1)
 						print 'unknown packet',pktType
@@ -208,6 +227,7 @@ class peer:
 				if selfref():
 					traceback.print_exc()
 					print 'shutting down read queue',addr
+			keepAliveTimer.cancel()
 
 		selfref().readThread = threading.Thread(target=recv)
 		selfref().readThread.start()
@@ -224,8 +244,9 @@ class peer:
 			if selfref():
 				traceback.print_exc()
 				print 'shutting down write queue',addr
-
-		#tell torrent I've disconnected
+		finally:
+			#tell torrent I've disconnected
+			mainLoop.do(selfref().torrent().disconnection, [(selfref().ip, selfref().port)])
 
 
 	def sendMessage(self,msg=None,payload=''):
@@ -244,18 +265,29 @@ class peer:
 
 	def keepAlive(self): #every 2 minutes
 		self.sendMessage()
-	def choke(self):
-		self.choked = True
-		self.sendMessage(0)
-	def unchoke(self):
-		self.choked = False
-		self.sendMessage(1)
-	def interested(self):
-		self.interesting = True
-		self.sendMessage(2)
-	def uninterested(self):
-		self.interesting = False
-		self.sendMessage(3)
+
+	@property
+	def choked(self): return self._choked
+
+	@choked.setter
+	def choked(self, value):
+		if self._choked == value: return
+		self._choked = value
+		if self._choked:
+			self.sendMessage(0)
+		else: self.sendMessage(1)
+
+	@property
+	def interesting(self): return self._interesting
+
+	@interesting.setter
+	def interesting(self, value):
+		if self._interesting == value: return
+		self._interesting = value
+		if self._interesting:
+			self.sendMessage(2)
+		else: self.sendMessage(3)
+
 	def have(self,index):
 		self.sendMessage(4, struct.pack('>I',len(index)))
 	def bitfield(self):
@@ -376,6 +408,10 @@ class torrent:
 	def newconnection(self, skt, addr, protocol, peer_id):
 		print 'peer trying to connect:',addr,protocol,peer_id
 
+	def disconnection(self, peer):
+		if peer in self.peers:
+			print 'connection failed',peer
+			del self.peers[peer]
 
 	def trackerRequest(self,event='',setpeerlist=True):
 		url = self.torInfo['announce'] + '?' + self.trackerInfo(event=event)
