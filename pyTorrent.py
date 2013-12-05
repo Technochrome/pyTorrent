@@ -266,6 +266,7 @@ class peer:
 		self.skt.send(self.torrent().torrenter().peer_id)
 
 	def keepAlive(self): #every 2 minutes
+		print 'keepAlive',self.ip, self.port
 		self.sendMessage()
 
 	def pieceDownloaded(self, idx, pos, data):
@@ -423,12 +424,15 @@ class torrent:
 
 	def pieceDownloaded(self,peer,blk, data):
 		if not self.pieceAvailable[blk]:
-			self.writeBlock(blk,data)
-			self.pieceAvailable[blk] = True
-			for p in self.peers.values():
-				p.gotPiece(blk)
-			self.left -= len(data)
-			print 'block downloaded',blk,'progress:',self.length-self.left,'/',self.length
+			if bytearray(hashlib.sha1(data).digest()) != bytearray(self.pieceHash[blk]):
+				print 'block %5d hash mismatch' % blk
+			else:
+				self.writeBlock(blk,data)
+				self.pieceAvailable[blk] = True
+				for p in self.peers.values():
+					p.gotPiece(blk)
+				self.left -= len(data)
+				print 'block %5d downloaded - progress: %3.2f%%'%(blk, 100*(1-self.left/float(self.length)))
 
 		if peer.interesting:
 			self.downloadRandomBlock(peer)
