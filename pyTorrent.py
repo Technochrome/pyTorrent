@@ -111,6 +111,9 @@ class peer:
 
 		self.writeThread = threading.Thread(target=peer.readWriteThread,args=[weakref.ref(self)])
 		self.writeThread.start()
+
+		self.downloadingBlock = None
+		self.partialBlockData = bytearray()
 	def __del__(self):
 		try: self.skt.close()
 		except: pass
@@ -152,10 +155,14 @@ class peer:
 						selfref().skt.close()
 						return
 
-					print protocol, addr
 				print 'connected to',addr
 				#tell torrent I've connected
 				keepAliveTimer = repeatTimer(120,selfref().keepAlive)
+				def checkIfInteresting(idx):
+					if not selfref().torrent().pieceAvailable[idx]:
+						selfref().interesting = True
+						selfref().interestingBlocks.add(idx)
+
 				while True:
 					data = get(4)
 					if len(data) < 4:
@@ -172,6 +179,7 @@ class peer:
 
 					elif pktType == 1: #unchoke
 						selfref().choking = False
+						mainLoop.do(selfref().torrent().unchoke, [selfref()])
 						print addr,'unchoke'
 
 					elif pktType == 2: #interested
@@ -184,31 +192,25 @@ class peer:
 
 					elif pktType == 4: #have
 						idx = struct.unpack('>I', get(4))[0]
-						# print addr,'have',idx
 						selfref().pieceAvailable[idx] = True
-						if not selfref().torrent().pieceAvailable[idx]:
-							selfref().interesting = True
-							selfref().interestingBlocks.add(idx)
+						checkIfInteresting(idx)
 
 					elif pktType == 5: #bitfield
-						# print addr,'bitfield'
 						selfref().pieceAvailable.set(get(pktLen-1))
-						# print selfref().pieceAvailable
 						for idx in range(len(selfref().pieceAvailable)):
-							if not selfref().torrent().pieceAvailable[idx]:
-								selfref().interesting = True
-								selfref().interestingBlocks.add(idx)
+							checkIfInteresting(idx)
 
 					elif pktType == 6: #request
-						print addr,'request'
 						(idx, pPos, pLen) = struct.unpack('>III', get(12))
+						print addr,'request',idx,pPos,pLen
 						# if not self.choked and selfref().torrent().pieceAvailable[idx]:
 							# self.piece()
 
 					elif pktType == 7: #piece
-						print addr,'piece'
-						(idx, pPos) = struct.unpack('>II', get(8))
+						# print addr,'piece'
+						(idx, pos) = struct.unpack('>II', get(8))
 						data = get(pktLen - 9)
+						selfref().pieceDownloaded(idx, pos, data)
 
 					elif pktType == 8: #cancel
 						print addr,'cancel, ignoring'
@@ -235,7 +237,7 @@ class peer:
 		try:
 			while True:
 				data = selfref().writeQueue.get()
-				print len(data),repr(data)
+				# print len(data),repr(data)
 				selfref().skt.send(data)
 				selfref().writeQueue.task_done()
 		except socket.error, e:
@@ -266,6 +268,32 @@ class peer:
 	def keepAlive(self): #every 2 minutes
 		self.sendMessage()
 
+	def pieceDownloaded(self, idx, pos, data):
+		# print 'piece downloaded', idx,'pos', pos, 'downloaded',len(self.partialBlockData)
+
+		self.partialBlockData += bytearray(data)
+		start, length = self.torrent().blockRange(idx)
+		if len(self.partialBlockData) < length:
+			self.request(idx, len(self.partialBlockData))
+		else : #completely downloaded
+			self.downloadingBlock = None
+			mainLoop.do(self.torrent().pieceDownloaded, [self, idx, self.partialBlockData])
+
+	def downloadBlock(self,idx):
+		self.downloadingBlock = idx
+		self.partialBlockData = bytearray()
+		pos = len(self.partialBlockData)
+		self.request(idx,0)
+		# print 'getting piece',idx
+
+	def gotPiece(self,idx):
+		if idx in self.interestingBlocks:
+			self.interestingBlocks.remove(idx)
+			if len(self.interestingBlocks) == 0:
+				self.interesting = False
+			self.have(idx)
+
+
 	@property
 	def choked(self): return self._choked
 
@@ -289,15 +317,15 @@ class peer:
 		else: self.sendMessage(3)
 
 	def have(self,index):
-		self.sendMessage(4, struct.pack('>I',len(index)))
+		self.sendMessage(4, struct.pack('>I',index))
 	def bitfield(self):
 		self.sendMessage(5, self.torrent().pieceAvailable.bytes)
 	def request(self,blk,offset):
-		self.sendMessage(6, struct.pack('>III',blk,offset,math.min(1<<14, self.torrent().blockRange(blk)[1] - offset))) # use block size of 2^14
+		self.sendMessage(6, struct.pack('>III',blk,offset,min(1<<14, self.torrent().blockRange(blk)[1] - offset))) # use block size of 2^14
 	def piece(self,blk,offset,data):
 		self.sendMessage(7, struct.pack('>II',blk,offset) + data)
 	def cancel(self,blk,offset):
-		self.sendMessage(8, struct.pack('>III',blk,offset,math.min(1<<14, self.torrent().blockRange(blk)[1] - offset))) # use block size of 2^14
+		self.sendMessage(8, struct.pack('>III',blk,offset,min(1<<14, self.torrent().blockRange(blk)[1] - offset))) # use block size of 2^14
 
 class torrenter:
 	firstPort = 6880
@@ -362,6 +390,7 @@ class torrent:
 		self.pieceHash = [bytearray(pieces[i*size:(i+1)*size]) for i in range(len(pieces)/size)]
 		self.pieceCount = len(self.pieceHash)
 		self.pieceAvailable = pieceBitfield(self.pieceCount) #RELOAD
+		self.pieceDownloading = pieceBitfield(self.pieceCount)
 
 		self.torrenter = weakref.ref(torrenter)
 		self.info_hash = hashlib.sha1(self.torInfo['__raw_info']).digest()
@@ -382,8 +411,27 @@ class torrent:
 			self.folder = self.info['name']
 		else: #singlefile mode
 			self.length = self.left = self.info['length']
+			self.info['files'] = [{'path':[self.info['name']], 'length':self.length}]
 			self.fileLen.append(self.length)
 			self.folder = None
+
+	def downloadRandomBlock(self,peer):
+		peer.downloadBlock(random.choice(list(peer.interestingBlocks)))
+
+	def unchoke(self,peer):
+		self.downloadRandomBlock(peer)
+
+	def pieceDownloaded(self,peer,blk, data):
+		if not self.pieceAvailable[blk]:
+			self.writeBlock(blk,data)
+			self.pieceAvailable[blk] = True
+			for p in self.peers.values():
+				p.gotPiece(blk)
+			self.left -= len(data)
+			print 'block downloaded',blk,'progress:',self.length-self.left,'/',self.length
+
+		if peer.interesting:
+			self.downloadRandomBlock(peer)
 
 	def scrapeURL(self):
 		s = self.torInfo['announce']
@@ -442,8 +490,8 @@ class torrent:
 		for p in self.peerlist:
 			num+=1
 			self.peers[p[0]] = peer(p,self)
-			if num > 10:
-				break
+			# if num > 10:
+			# 	break
 
 
 		#choose top # peers
@@ -515,7 +563,7 @@ class torrent:
 		# print 'write block',blkNum
 		def w(filename,fileStart,blkStart,sectionLen):
 			parent = os.path.dirname(filename)
-			if not os.path.exists(parent):	
+			if len(parent) and not os.path.exists(parent):	
 				os.makedirs(parent)
 
 			if not os.path.exists(filename):
