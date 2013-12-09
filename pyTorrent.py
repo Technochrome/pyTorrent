@@ -11,6 +11,22 @@ import bisect
 import struct
 import traceback
 import socket
+from test_win import *
+
+def _log(level, *args):
+	msg = ' '.join(str(arg) for arg in args)
+	logQueue.put((level,msg))
+	# print msg
+
+def log(*args): _log(2,*args)
+def logWarn(*args): _log(3,*args)
+def logErr (*args): _log(1,*args)
+def logInfo(*args): _log(6,*args)
+
+def blkUpdate(blk,color=2):
+	logQueue.put((color,blk))
+
+logQueue = Queue.Queue()
 
 class obj:
 	pass
@@ -25,8 +41,8 @@ class runloop:
 					return
 				try:
 					target(*args,**kwargs)
-				except:
-					traceback.print_exc()
+				except: pass
+					# traceback.print_exc()
 			except:
 				return
 
@@ -109,7 +125,7 @@ class peer:
 		self.readQueue = Queue.Queue()
 		self.writeQueue = Queue.Queue()
 
-		self.writeThread = threading.Thread(target=peer.readWriteThread,args=[weakref.ref(self)])
+		self.writeThread = threading.Thread(target=peer.readWriteThread,args=[weakref.ref(self)],name='%s write'%ip)
 		self.writeThread.start()
 
 		self.downloadingBlock = None
@@ -129,126 +145,135 @@ class peer:
 
 	@staticmethod
 	def readWriteThread(selfref):
-		established = hasattr(selfref(),'skt')
-		if not established:
-			try:
-				selfref().skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-				selfref().skt.connect((selfref().ip, selfref().port))
-			except:
-				# print 'connection failed', selfref().ip, selfref().port
-				#tell torrent I've disconnected
-				mainLoop.do(selfref().torrent().disconnection, [(selfref().ip, selfref().port)])
-				return
+		try:
+			established = hasattr(selfref(),'skt')
+			if not established:
+				try:
+					selfref().skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+					selfref().skt.connect((selfref().ip, selfref().port))
+				except:
+					# print 'connection failed', selfref().ip, selfref().port
+					#tell torrent I've disconnected
+					try: mainLoop.do(selfref().torrent().disconnection, [(selfref().ip, selfref().port)])
+					except: pass
+					return
 
-		selfref().handshake()
-		addr = selfref().skt.getpeername()
+			selfref().handshake()
+			addr = selfref().skt.getpeername()
 
-		def recv():
-			def get(l):
-				if l <= 0: return None
-				return selfref().skt.recv(l,socket.MSG_WAITALL)
-			try:
-				if not established:
-					try: protocol, info_hash, selfref().peer_id = peer.readHandshake(selfref().skt)
-					except: 
-						print 'no handshake from',addr
-						selfref().skt.close()
-						return
+			def recv():
+				def get(l):
+					if l <= 0: return None
+					return selfref().skt.recv(l,socket.MSG_WAITALL)
+				try:
+					if not established:
+						try: protocol, info_hash, selfref().peer_id = peer.readHandshake(selfref().skt)
+						except: 
+							
+							logWarn('no handshake from',addr)
+							selfref().skt.close()
+							return
 
-				print 'connected to',addr
-				#tell torrent I've connected
-				keepAliveTimer = repeatTimer(120,selfref().keepAlive)
-				def checkIfInteresting(idx):
-					if not selfref().torrent().pieceAvailable[idx]:
-						selfref().interesting = True
-						selfref().interestingBlocks.add(idx)
+					log('connected to',addr)
+					#tell torrent I've connected
+					keepAliveTimer = repeatTimer(120,selfref().keepAlive)
+					def checkIfInteresting(idx):
+						if not selfref().torrent().pieceAvailable[idx]:
+							selfref().interesting = True
+							selfref().interestingBlocks.add(idx)
 
-				while True:
-					data = get(4)
-					if len(data) < 4:
-						raise socket.error() 
-					pktLen = struct.unpack('>I',data)[0]
+					while True:
+						data = get(4)
+						if len(data) < 4:
+							raise socket.error() 
+						pktLen = struct.unpack('>I',data)[0]
 
-					if pktLen == 0: #keepAlive
-						continue
+						if pktLen == 0: #keepAlive
+							logInfo('keepAlive from',addr)
+							continue
 
-					pktType = ord(get(1))
-					if pktType == 0: #choke
-						selfref().choking = True
-						print addr,'choke'
+						pktType = ord(get(1))
+						if pktType == 0: #choke
+							selfref().choking = True
+							logInfo(addr,'choke')
 
-					elif pktType == 1: #unchoke
-						selfref().choking = False
-						mainLoop.do(selfref().torrent().unchoke, [selfref()])
-						print addr,'unchoke'
+						elif pktType == 1: #unchoke
+							selfref().choking = False
+							mainLoop.do(selfref().torrent().unchoke, [selfref()])
+							logInfo(addr,'unchoke')
 
-					elif pktType == 2: #interested
-						selfref().interested = True
-						print addr,'interested'
+						elif pktType == 2: #interested
+							selfref().interested = True
+							log(addr,'interested')
 
-					elif pktType == 3: #uninterested
-						selfref().interested = False
-						print addr,'uninterested'
+						elif pktType == 3: #uninterested
+							selfref().interested = False
+							log(addr,'uninterested')
 
-					elif pktType == 4: #have
-						idx = struct.unpack('>I', get(4))[0]
-						selfref().pieceAvailable[idx] = True
-						checkIfInteresting(idx)
-
-					elif pktType == 5: #bitfield
-						selfref().pieceAvailable.set(get(pktLen-1))
-						for idx in range(len(selfref().pieceAvailable)):
+						elif pktType == 4: #have
+							idx = struct.unpack('>I', get(4))[0]
+							selfref().pieceAvailable[idx] = True
+							# logInfo(addr,'has',idx)
 							checkIfInteresting(idx)
 
-					elif pktType == 6: #request
-						(idx, pPos, pLen) = struct.unpack('>III', get(12))
-						print addr,'request',idx,pPos,pLen
-						# if not self.choked and selfref().torrent().pieceAvailable[idx]:
-							# self.piece()
+						elif pktType == 5: #bitfield
+							selfref().pieceAvailable.set(get(pktLen-1))
+							logInfo(addr,'bitfield',selfref().pieceAvailable)
+							for idx in range(len(selfref().pieceAvailable)):
+								checkIfInteresting(idx)
 
-					elif pktType == 7: #piece
-						# print addr,'piece'
-						(idx, pos) = struct.unpack('>II', get(8))
-						data = get(pktLen - 9)
-						selfref().pieceDownloaded(idx, pos, data)
+						elif pktType == 6: #request
+							(idx, pPos, pLen) = struct.unpack('>III', get(12))
+							log(addr,'request',idx,pPos,pLen)
+							# if not self.choked and selfref().torrent().pieceAvailable[idx]:
+								# self.piece()
 
-					elif pktType == 8: #cancel
-						print addr,'cancel, ignoring'
-						(idx, pPos, pLen) = struct.unpack('>III', get(12))
+						elif pktType == 7: #piece
+							# print addr,'piece'
+							(idx, pos) = struct.unpack('>II', get(8))
+							data = get(pktLen - 9)
+							logInfo(addr,'piece',idx,'[',pos,',',pos+len(data),']')
+							selfref().pieceDownloaded(idx, pos, data)
 
-					elif pktType == 9: #port
-						print addr,'port, ignoring'
-						port = struct.unpack('>H', get(2))
+						elif pktType == 8: #cancel
+							logWarn(addr,'cancel, ignoring')
+							(idx, pPos, pLen) = struct.unpack('>III', get(12))
 
-					else:
-						get(pktLen-1)
-						print 'unknown packet',pktType
+						elif pktType == 9: #port
+							logWarn(addr,'port, ignoring')
+							port = struct.unpack('>H', get(2))
+
+						else:
+							get(pktLen-1)
+							logErr('unknown packet',pktType)
+				except socket.error, e:
+					logErr('socket error')
+				except Exception, e:
+					if selfref():
+						# traceback.print_exc()
+						logErr('shutting down read queue',addr)
+				keepAliveTimer.cancel()
+
+			selfref().readThread = threading.Thread(target=recv,name='%s read'%selfref().ip)
+			selfref().readThread.start()
+
+			try:
+				while True:
+					data = selfref().writeQueue.get()
+					# print len(data),repr(data)
+					selfref().skt.send(data)
+					selfref().writeQueue.task_done()
 			except socket.error, e:
-				print 'socket error'
+				logErr('socket error')
 			except Exception, e:
 				if selfref():
-					traceback.print_exc()
-					print 'shutting down read queue',addr
-			keepAliveTimer.cancel()
-
-		selfref().readThread = threading.Thread(target=recv)
-		selfref().readThread.start()
-
-		try:
-			while True:
-				data = selfref().writeQueue.get()
-				# print len(data),repr(data)
-				selfref().skt.send(data)
-				selfref().writeQueue.task_done()
-		except socket.error, e:
-			print 'socket error'
-		except Exception, e:
-			if selfref():
-				traceback.print_exc()
-				print 'shutting down write queue',addr
-		finally:
-			#tell torrent I've disconnected
-			mainLoop.do(selfref().torrent().disconnection, [(selfref().ip, selfref().port)])
+					# traceback.print_exc()
+					logErr('shutting down write queue',addr)
+			finally:
+				#tell torrent I've disconnected
+				mainLoop.do(selfref().torrent().disconnection, [(selfref().ip, selfref().port)])
+		except:
+			pass
 
 
 	def sendMessage(self,msg=None,payload=''):
@@ -266,7 +291,7 @@ class peer:
 		self.skt.send(self.torrent().torrenter().peer_id)
 
 	def keepAlive(self): #every 2 minutes
-		print 'keepAlive',self.ip, self.port
+		logInfo('keepAlive',self.ip, self.port)
 		self.sendMessage()
 
 	def pieceDownloaded(self, idx, pos, data):
@@ -361,11 +386,11 @@ class torrenter:
 			try:
 				self.serverSkt.bind(('', port))
 				self.port = port
-				print 'started on',self.port
+				log('started on',self.port)
 				break
 			except Exception, e:
 				if port == torrenter.lastPort:
-					print e
+					logErr(e)
 				pass
 
 		#listen on a socket on another thread
@@ -417,7 +442,10 @@ class torrent:
 			self.folder = None
 
 	def downloadRandomBlock(self,peer):
-		peer.downloadBlock(random.choice(list(peer.interestingBlocks)))
+		blk = random.choice(list(peer.interestingBlocks))
+		logInfo('downloading',blk)
+		peer.downloadBlock(blk)
+		blkUpdate(blk,4)
 
 	def unchoke(self,peer):
 		self.downloadRandomBlock(peer)
@@ -425,14 +453,16 @@ class torrent:
 	def pieceDownloaded(self,peer,blk, data):
 		if not self.pieceAvailable[blk]:
 			if bytearray(hashlib.sha1(data).digest()) != bytearray(self.pieceHash[blk]):
-				print 'block %5d hash mismatch' % blk
+				logErr('block %5d hash mismatch' % blk)
+				blkUpdate(blk,3)
 			else:
 				self.writeBlock(blk,data)
 				self.pieceAvailable[blk] = True
 				for p in self.peers.values():
 					p.gotPiece(blk)
 				self.left -= len(data)
-				print 'block %5d downloaded - progress: %3.2f%%'%(blk, 100*(1-self.left/float(self.length)))
+				log('block %5d downloaded - progress: %3.2f%%'%(blk, 100*(1-self.left/float(self.length))))
+				blkUpdate(blk)
 
 		if peer.interesting:
 			self.downloadRandomBlock(peer)
@@ -458,18 +488,18 @@ class torrent:
 		return urllib.urlencode(opts)
 
 	def newconnection(self, skt, addr, protocol, peer_id):
-		print 'peer trying to connect:',addr,protocol,peer_id
+		log('peer trying to connect:',addr,protocol,peer_id)
 
 	def disconnection(self, peer):
 		if peer in self.peers:
-			print 'connection failed',peer
+			logWarn('connection failed',peer)
 			del self.peers[peer]
 
 	def trackerRequest(self,event='',setpeerlist=True):
 		url = self.torInfo['announce'] + '?' + self.trackerInfo(event=event)
 		response = be.bDecode(urllib.urlopen(url).read())
 		if 'failure reason' in response:
-			print 'Tracker returned error',repr(response['failure reason'])
+			logErr('Tracker returned error',repr(response['failure reason']))
 			return
 
 		self.interval = int(response['interval'])
@@ -534,7 +564,6 @@ class torrent:
 			blkLen = ((self.length - 1) % blkLen) + 1
 
 		return (pieceStart, blkLen)
-
 
 	def pieceCallback(self,(pieceStart,pieceLen),callback,*info):
 		"""
@@ -612,11 +641,13 @@ class torrent:
 		return None
 
 
+
+
 if __name__ == "__main__":
 	"python __ filename.torrent"
 	"python __ -m magnetlink"
-	t = torrenter()
 	if len(sys.argv) == 2:
+		t = torrenter()
 		tor = torrent(sys.argv[1],t)
 		# be.printBencode(tor.torInfo)
 
@@ -627,17 +658,35 @@ if __name__ == "__main__":
 				arr = tor.readBlock(i)
 				print arr[:10], arr[-10:]
 
-		tor.start()
-		# connection = peerManagement(t, tor)
-		# connection.toString()
-		raw_input('Press [Enter] to quit\n')
-		print 'shutting down (%d)'%threading.activeCount()
-		tor.stop()
+		def runloop(window):
+			window.screen.timeout(20)
+			tor.start()
+			window.setTitle('%s - press [any key] to quit' % tor.info['name'])
+			while True:
+				try:
+					while True:
+						color,item = logQueue.get_nowait()
+						if isinstance(item,int):
+							window.blockDownloaded(item,color)
+						else:
+							window.statusUpdate(item,color)
+				except: pass
+
+				if window.screen.getch() != -1:
+					break
+
+			print 'shutting down (%d)'%threading.activeCount()
+			tor.stop()
+
+		torrentWindow(tor.pieceCount, runloop)
 		del t
 	elif len(sys.argv) == 3:
-		with open(sys.argv[2]) as f:
-			url = f.read()
-		print torrent.magnetLink(url)
-		print urllib.urlencode({4:torrent.magnetLink(url)['hash']})
+		tor = be.bDecodeFile(open(sys.argv[2],'r'))
+		be.printBencode(tor)
+		# with open(sys.argv[2]) as f:
+		# 	url = f.read()
+		# print torrent.magnetLink(url)
+		# print urllib.urlencode({4:torrent.magnetLink(url)['hash']})
+	mainLoop.shutdown()
 	sys.exit()
 
