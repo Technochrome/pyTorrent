@@ -219,7 +219,7 @@ class peer:
 						elif pktType == 5: #bitfield
 							selfref().pieceAvailable.set(get(pktLen-1))
 							logInfo(addr,'bitfield',selfref().pieceAvailable)
-							for idx in range(len(selfref().pieceAvailable)):
+							for idx in range(selfref().torrent().pieceCount):
 								checkIfInteresting(idx)
 
 						elif pktType == 6: #request
@@ -232,7 +232,7 @@ class peer:
 							# print addr,'piece'
 							(idx, pos) = struct.unpack('>II', get(8))
 							data = get(pktLen - 9)
-							logInfo(addr,'piece',idx,'[',pos,',',pos+len(data),']')
+							# logInfo(addr,'piece',idx,'[',pos,',',pos+len(data),']')
 							selfref().pieceDownloaded(idx, pos, data)
 
 						elif pktType == 8: #cancel
@@ -443,7 +443,7 @@ class torrent:
 
 	def downloadRandomBlock(self,peer):
 		blk = random.choice(list(peer.interestingBlocks))
-		logInfo('downloading',blk)
+		# logInfo('downloading',blk)
 		peer.downloadBlock(blk)
 		blkUpdate(blk,4)
 
@@ -461,7 +461,7 @@ class torrent:
 				for p in self.peers.values():
 					p.gotPiece(blk)
 				self.left -= len(data)
-				log('block %5d downloaded - progress: %3.2f%%'%(blk, 100*(1-self.left/float(self.length))))
+				# log('block %5d downloaded - progress: %3.2f%%'%(blk, 100*(1-self.left/float(self.length))))
 				blkUpdate(blk)
 
 		if peer.interesting:
@@ -682,7 +682,7 @@ if __name__ == "__main__":
 		del t
 	elif len(sys.argv) == 3:
 		tor = be.bDecodeFile(open(sys.argv[2],'r'))
-		be.printBencode(tor)
+		be.printBencode(tor,byteLen=70)
 		# with open(sys.argv[2]) as f:
 		# 	url = f.read()
 		# print torrent.magnetLink(url)
